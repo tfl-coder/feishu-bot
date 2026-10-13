@@ -1,0 +1,10 @@
+# 真实配置与运行数据（切勿入库）
+app_config.yaml
+config.yaml
+messages.jsonl
+watermark.json
+exercise_log.md
+phone_usage.md
+*.log
+venv/
+__pycache__/

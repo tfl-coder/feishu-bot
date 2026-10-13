@@ -1,0 +1,3 @@
+# 飞书自建应用配置（复制为 app_config.yaml 后填入真实值，真实文件不要入库）
+app_id: cli_xxxxxxxxxxxxxxxx
+app_secret: <your-app-secret>

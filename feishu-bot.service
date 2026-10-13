@@ -1,0 +1,24 @@
+[Unit]
+Description=Feishu custom-app bot bridge for Muse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hatch/workspace/feishu
+ExecStart=/home/hatch/workspace/feishu/venv/bin/python /home/hatch/workspace/feishu/bot.py
+# 出站经本地代理（无需鉴权；不含密钥）。wss/ws 映射由 bot.py 在运行时补齐。
+Environment=http_proxy=http://hatch-egress-proxy:3128
+Environment=https_proxy=http://hatch-egress-proxy:3128
+Environment=HTTP_PROXY=http://hatch-egress-proxy:3128
+Environment=HTTPS_PROXY=http://hatch-egress-proxy:3128
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=5
+TimeoutStopSec=20
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

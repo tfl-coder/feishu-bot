@@ -1,0 +1,309 @@
+#!/home/hatch/workspace/feishu/venv/bin/python
+"""feishu CLI：查看长连接服务收到的消息 / 以自建应用身份主动发消息。
+
+支持的消息类型（send 子命令）：
+  文本（默认）  feishu send --chat-id <id> "文本"
+  富文本 post   feishu send --chat-id <id> --post "正文" [--title "标题"]
+  图片 image    feishu send --chat-id <id> --image /path/pic.png
+  文件 file     feishu send --chat-id <id> --file /path/doc.pdf
+  卡片 card     feishu send --chat-id <id> --card-title "标题" --card-text "正文(lark_md)"
+                feishu send --chat-id <id> --card-json /path/card.json
+"""
+import argparse
+import json
+import mimetypes
+import os
+import sys
+import urllib.request
+import uuid
+
+import yaml
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_PATH = os.path.join(BASE_DIR, "app_config.yaml")
+STORE_PATH = os.path.join(BASE_DIR, "messages.jsonl")
+API_BASE = "https://open.feishu.cn"
+
+_PLACEHOLDERS = {"", None, "YOUR_APP_ID", "YOUR_APP_SECRET"}
+
+_FILE_TYPES = {
+    ".pdf": "pdf",
+    ".doc": "doc",
+    ".docx": "doc",
+    ".xls": "xls",
+    ".xlsx": "xls",
+    ".ppt": "ppt",
+    ".pptx": "ppt",
+    ".mp4": "mp4",
+    ".opus": "opus",
+}
+
+
+def load_config():
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def require_credentials(cfg):
+    if cfg.get("app_id") in _PLACEHOLDERS or cfg.get("app_secret") in _PLACEHOLDERS:
+        print(
+            "app_config.yaml 里 app_id/app_secret 还是占位值，先填真实凭证。",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+def _read_body_or_die(e):
+    print(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:500]}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _open(req, timeout):
+    """urlopen 带一次重试：代理偶发 RemoteDisconnected 时不至于整条消息失败。"""
+    import http.client
+
+    last_exc = None
+    for _ in range(2):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, http.client.RemoteDisconnected, ConnectionError) as e:
+            last_exc = e
+    raise last_exc
+
+
+def _post_json(url, payload, token=None):
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with _open(req, timeout=30) as resp:
+            return resp.status, resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        _read_body_or_die(e)
+
+
+def _post_multipart(url, fields, file_field, file_path, token):
+    """fields: dict[str,str]；file_field: 文件字段名。返回解析后的 JSON dict。"""
+    boundary = "----feishu" + uuid.uuid4().hex
+    body = bytearray()
+    for name, value in fields.items():
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        body += f"{value}\r\n".encode()
+    filename = os.path.basename(file_path)
+    ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    body += f"--{boundary}\r\n".encode()
+    body += (
+        f'Content-Disposition: form-data; name="{file_field}"; '
+        f'filename="{filename}"\r\n'
+    ).encode()
+    body += f"Content-Type: {ctype}\r\n\r\n".encode()
+    with open(file_path, "rb") as f:
+        body += f.read()
+    body += f"\r\n--{boundary}--\r\n".encode()
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Authorization": f"Bearer {token}",
+    }
+    req = urllib.request.Request(url, data=bytes(body), headers=headers, method="POST")
+    try:
+        with _open(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        _read_body_or_die(e)
+    if data.get("code") != 0:
+        print(f"上传失败: {json.dumps(data, ensure_ascii=False)[:500]}", file=sys.stderr)
+        raise SystemExit(1)
+    return data
+
+
+def _get_json(url, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with _open(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        _read_body_or_die(e)
+
+
+def _get_tenant_token(cfg):
+    _, body = _post_json(
+        f"{API_BASE}/open-apis/auth/v3/tenant_access_token/internal",
+        {"app_id": cfg["app_id"], "app_secret": cfg["app_secret"]},
+    )
+    data = json.loads(body)
+    if data.get("code") != 0 or not data.get("tenant_access_token"):
+        print(f"获取 tenant_access_token 失败: {body[:300]}", file=sys.stderr)
+        raise SystemExit(1)
+    return data["tenant_access_token"]
+
+
+def _send_message(token, chat_id, msg_type, content_obj):
+    url = f"{API_BASE}/open-apis/im/v1/messages?receive_id_type=chat_id"
+    payload = {
+        "receive_id": chat_id,
+        "msg_type": msg_type,
+        "content": json.dumps(content_obj, ensure_ascii=False),
+    }
+    status, body = _post_json(url, payload, token=token)
+    print(f"HTTP {status}: {body[:500]}")
+
+
+def _upload_image(token, path):
+    data = _post_multipart(
+        f"{API_BASE}/open-apis/im/v1/images",
+        {"image_type": "message"},
+        "image",
+        path,
+        token,
+    )
+    return data["data"]["image_key"]
+
+
+def _upload_file(token, path):
+    ext = os.path.splitext(path)[1].lower()
+    file_type = _FILE_TYPES.get(ext, "stream")
+    data = _post_multipart(
+        f"{API_BASE}/open-apis/im/v1/files",
+        {"file_type": file_type, "file_name": os.path.basename(path)},
+        "file",
+        path,
+        token,
+    )
+    return data["data"]["file_key"]
+
+
+def cmd_recent(args):
+    if not os.path.exists(STORE_PATH):
+        print("暂无消息。")
+        return
+    with open(STORE_PATH, "r", encoding="utf-8") as f:
+        lines = [json.loads(line) for line in f if line.strip()]
+    for rec in lines[-args.n :]:
+        ts = rec.get("received_at", "?")
+        print(f"[{ts}] chat={rec.get('chat_id')} {rec.get('sender_id')}: {rec.get('text')!r}")
+
+
+def cmd_history(args):
+    import time as _time
+    from datetime import datetime
+
+    cfg = load_config()
+    require_credentials(cfg)
+    token = _get_tenant_token(cfg)
+    end = int(_time.time())
+    start = end - int(args.hours * 3600)
+    items = []
+    page_token = ""
+    for _ in range(5):
+        url = (
+            f"{API_BASE}/open-apis/im/v1/messages?container_id_type=chat"
+            f"&container_id={args.chat_id}&start_time={start}&end_time={end}"
+            f"&page_size=50&sort_type=ByCreateTimeAsc"
+        )
+        if page_token:
+            url += f"&page_token={page_token}"
+        data = _get_json(url, token)
+        if data.get("code") != 0:
+            print(f"读取历史失败: {json.dumps(data, ensure_ascii=False)[:500]}", file=sys.stderr)
+            raise SystemExit(1)
+        d = data.get("data", {})
+        items.extend(d.get("items", []))
+        if not d.get("has_more"):
+            break
+        page_token = d.get("page_token", "")
+    for it in items:
+        ts = datetime.fromtimestamp(int(it.get("create_time", 0)) / 1000).strftime("%m-%d %H:%M")
+        sender = (it.get("sender") or {}).get("id", "?")
+        msg_type = it.get("msg_type", "?")
+        raw = (it.get("body") or {}).get("content", "")
+        text = raw
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and "text" in parsed:
+                text = parsed["text"]
+        except Exception:
+            pass
+        print(f"[{ts}] {sender} {msg_type}: {text}")
+
+
+def cmd_send(args):
+    cfg = load_config()
+    require_credentials(cfg)
+    token = _get_tenant_token(cfg)
+
+    if args.image:
+        image_key = _upload_image(token, args.image)
+        _send_message(token, args.chat_id, "image", {"image_key": image_key})
+    elif args.file:
+        file_key = _upload_file(token, args.file)
+        _send_message(token, args.chat_id, "file", {"file_key": file_key})
+    elif args.card_json:
+        with open(args.card_json, "r", encoding="utf-8") as f:
+            card = json.load(f)
+        _send_message(token, args.chat_id, "interactive", card)
+    elif args.card_title or args.card_text:
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": args.card_title or "Yuki"},
+                "template": args.card_color,
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": args.card_text or ""},
+                }
+            ],
+        }
+        _send_message(token, args.chat_id, "interactive", card)
+    elif args.post is not None:
+        paragraphs = [
+            [{"tag": "text", "text": line}] for line in args.post.split("\n")
+        ]
+        post = {"zh_cn": {"title": args.title or "", "content": paragraphs}}
+        _send_message(token, args.chat_id, "post", post)
+    else:
+        if args.text is None:
+            print("缺少要发送的文本。", file=sys.stderr)
+            raise SystemExit(2)
+        _send_message(token, args.chat_id, "text", {"text": args.text})
+
+
+def main():
+    p = argparse.ArgumentParser(prog="feishu")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pr = sub.add_parser("recent", help="查看最近收到的消息")
+    pr.add_argument("-n", type=int, default=20)
+    pr.set_defaults(func=cmd_recent)
+
+    ph = sub.add_parser("history", help="读群历史消息（含应用自己发的）")
+    ph.add_argument("--chat-id", required=True)
+    ph.add_argument("--hours", type=float, default=14, help="往前读多少小时（默认 14）")
+    ph.set_defaults(func=cmd_history)
+
+    ps = sub.add_parser("send", help="给指定会话(chat_id)发消息（文本/富文本/图片/文件/卡片）")
+    ps.add_argument("--chat-id", required=True, help="目标会话的 chat_id")
+    ps.add_argument("text", nargs="?", help="文本内容（默认类型必填）")
+    ps.add_argument("--post", metavar="TEXT", help="发富文本 post，正文按换行分段")
+    ps.add_argument("--title", help="post 的标题")
+    ps.add_argument("--image", metavar="PATH", help="发图片：本地图片路径（自动上传）")
+    ps.add_argument("--file", metavar="PATH", help="发文件：本地文件路径（自动上传）")
+    ps.add_argument("--card-title", help="发卡片：卡片标题")
+    ps.add_argument("--card-text", help="发卡片：卡片正文（lark_md）")
+    ps.add_argument("--card-color", default="blue", help="卡片标题栏颜色，如 blue/green/red/orange")
+    ps.add_argument("--card-json", metavar="PATH", help="发卡片：直接用 JSON 文件作为卡片内容")
+    ps.set_defaults(func=cmd_send)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
